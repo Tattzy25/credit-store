@@ -10,13 +10,10 @@ import { z } from "zod";
 
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL!;
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN!;
-const MCP_SHARED_SECRET = process.env.MCP_SHARED_SECRET || "";
 const PORT = parseInt(process.env.PORT || "3001", 10);
 
 if (!REDIS_URL || !REDIS_TOKEN) {
-  throw new Error(
-    "Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN",
-  );
+  throw new Error("Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN");
 }
 
 // ─────────────────────────────────────────────
@@ -79,7 +76,7 @@ interface LedgerEntry {
   id: string;
   userId: string;
   entryType: LedgerEntryType;
-  amount: number; // positive or negative
+  amount: number;
   balanceAfter: number;
   referenceType: ReferenceType;
   referenceId: string;
@@ -116,12 +113,6 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function asSingleString(value: unknown): string | undefined {
-  if (typeof value === "string") return value;
-  if (Array.isArray(value) && typeof value[0] === "string") return value[0];
-  return undefined;
-}
-
 function normalizeUserId(raw: string): string {
   return raw.trim().toLowerCase();
 }
@@ -149,7 +140,9 @@ function jsonText(payload: unknown) {
 async function redisCommand<T = unknown>(
   ...parts: Array<string | number>
 ): Promise<T | null> {
-  const encoded = parts.map((part) => encodeURIComponent(String(part))).join("/");
+  const encoded = parts
+    .map((part) => encodeURIComponent(String(part)))
+    .join("/");
   const res = await fetch(`${REDIS_URL}/${encoded}`, {
     method: "POST",
     headers: {
@@ -175,13 +168,19 @@ async function setBalance(userId: string, balance: number): Promise<void> {
   await redisCommand("SET", walletKey(userId), balance);
 }
 
-async function pushLedgerEntry(userId: string, entry: LedgerEntry): Promise<void> {
+async function pushLedgerEntry(
+  userId: string,
+  entry: LedgerEntry,
+): Promise<void> {
   await redisCommand("RPUSH", ledgerKey(userId), JSON.stringify(entry));
   await redisCommand("LTRIM", ledgerKey(userId), -1000, -1);
 }
 
 async function getLedgerPage(userId: string, cursor = 0, limit = 25) {
-  const total = safeParseNumber(await redisCommand<number>("LLEN", ledgerKey(userId)), 0);
+  const total = safeParseNumber(
+    await redisCommand<number>("LLEN", ledgerKey(userId)),
+    0,
+  );
 
   if (total === 0) {
     return {
@@ -205,7 +204,10 @@ async function getLedgerPage(userId: string, cursor = 0, limit = 25) {
     };
   }
 
-  const raw = (await redisCommand<string[]>("LRANGE", ledgerKey(userId), start, end)) || [];
+  const raw =
+    (await redisCommand<string[]>("LRANGE", ledgerKey(userId), start, end)) ||
+    [];
+
   const entries = raw
     .map((item) => {
       try {
@@ -229,14 +231,25 @@ async function getLedgerPage(userId: string, cursor = 0, limit = 25) {
   };
 }
 
-async function withUserLock<T>(userId: string, fn: () => Promise<T>): Promise<T> {
+async function withUserLock<T>(
+  userId: string,
+  fn: () => Promise<T>,
+): Promise<T> {
   const key = lockKey(userId);
   const token = randomUUID();
   const timeoutMs = 5000;
   const started = Date.now();
 
   while (Date.now() - started < timeoutMs) {
-    const acquired = await redisCommand<string>("SET", key, token, "NX", "EX", 5);
+    const acquired = await redisCommand<string>(
+      "SET",
+      key,
+      token,
+      "NX",
+      "EX",
+      5,
+    );
+
     if (acquired === "OK") {
       try {
         return await fn();
@@ -341,7 +354,6 @@ function createCreditsServer(userId: string): McpServer {
     version: "1.0.0",
   });
 
-  // 1) Get current balance
   server.registerTool(
     "credits_get_balance",
     {
@@ -364,7 +376,6 @@ function createCreditsServer(userId: string): McpServer {
     },
   );
 
-  // 2) Get available packs
   server.registerTool(
     "credits_get_packs",
     {
@@ -385,7 +396,6 @@ function createCreditsServer(userId: string): McpServer {
     },
   );
 
-  // 3) Get ledger
   server.registerTool(
     "credits_get_ledger",
     {
@@ -421,7 +431,6 @@ function createCreditsServer(userId: string): McpServer {
     },
   );
 
-  // 4) Purchase pack
   server.registerTool(
     "credits_purchase_pack",
     {
@@ -459,6 +468,7 @@ function createCreditsServer(userId: string): McpServer {
       idempotency_key?: string;
     }) => {
       const pack = PACK_BY_CODE.get(pack_code);
+
       if (!pack) {
         throw new Error(`Unknown pack code: ${pack_code}`);
       }
@@ -481,12 +491,12 @@ function createCreditsServer(userId: string): McpServer {
     },
   );
 
-  // 5) Add credits manually
   server.registerTool(
     "credits_add_credits",
     {
       title: "Add Credits",
-      description: "Add credits manually for bonus, support, or admin adjustments.",
+      description:
+        "Add credits manually for bonus, support, or admin adjustments.",
       inputSchema: {
         credits: z.number().int().min(1).describe("Credits to add"),
         reference_id: z.string().min(1).describe("Reference ID"),
@@ -536,12 +546,12 @@ function createCreditsServer(userId: string): McpServer {
     },
   );
 
-  // 6) Deduct credits
   server.registerTool(
     "credits_deduct_credits",
     {
       title: "Deduct Credits",
-      description: "Deduct credits when a user triggers generation or another paid action.",
+      description:
+        "Deduct credits when a user triggers generation or another paid action.",
       inputSchema: {
         credits: z.number().int().min(1).describe("Credits to deduct"),
         reference_id: z.string().min(1).describe("Generation job or action ID"),
@@ -591,7 +601,6 @@ function createCreditsServer(userId: string): McpServer {
     },
   );
 
-  // 7) Refund credits instantly
   server.registerTool(
     "credits_refund_credits",
     {
@@ -599,7 +608,10 @@ function createCreditsServer(userId: string): McpServer {
       description: "Refund credits instantly if something fails on your side.",
       inputSchema: {
         credits: z.number().int().min(1).describe("Credits to refund"),
-        reference_id: z.string().min(1).describe("Failed job or refund reference"),
+        reference_id: z
+          .string()
+          .min(1)
+          .describe("Failed job or refund reference"),
         idempotency_key: z
           .string()
           .min(1)
@@ -650,34 +662,12 @@ function createCreditsServer(userId: string): McpServer {
 }
 
 // ─────────────────────────────────────────────
-// AUTH / USER RESOLUTION
+// USER RESOLUTION
 // ─────────────────────────────────────────────
 
-function requireSharedSecret(req: Request, res: Response): boolean {
-  if (!MCP_SHARED_SECRET) return true;
-
-  const provided =
-    asSingleString(req.headers["x-mcp-secret"]) ||
-    asSingleString(req.query.secret);
-
-  if (provided !== MCP_SHARED_SECRET) {
-    res.status(401).json({ error: "Unauthorized" });
-    return false;
-  }
-
-  return true;
-}
-
 function resolveUserIdFromSharedRoute(req: Request): string | null {
-  const fromHeader =
-    asSingleString(req.headers["x-user-id"]) ||
-    asSingleString(req.headers["x-user"]);
-
-  const fromQuery = asSingleString(req.query.userId);
-
-  const userId = fromHeader || fromQuery;
+  const userId = req.header("x-user-id");
   if (!userId) return null;
-
   return normalizeUserId(userId);
 }
 
@@ -695,6 +685,7 @@ app.get("/health", (_req, res) => {
     status: "ok",
     service: "credits-mcp-server",
     routes: ["/mcp", "/u/:userId"],
+    auth: "disabled",
   });
 });
 
@@ -720,14 +711,12 @@ async function handleMcpRequest(req: Request, res: Response, userId: string) {
   }
 }
 
-// Shared route
 app.post("/mcp", async (req, res) => {
-  if (!requireSharedSecret(req, res)) return;
-
   const userId = resolveUserIdFromSharedRoute(req);
+
   if (!userId || userId.length < 2) {
     res.status(400).json({
-      error: "Missing or invalid user ID. Send x-user-id header or ?userId=...",
+      error: "Missing or invalid x-user-id header",
     });
     return;
   }
@@ -735,11 +724,9 @@ app.post("/mcp", async (req, res) => {
   await handleMcpRequest(req, res, userId);
 });
 
-// User-scoped route
 app.post("/u/:userId", async (req, res) => {
-  if (!requireSharedSecret(req, res)) return;
-
   const userId = normalizeUserId(req.params.userId || "");
+
   if (!userId || userId.length < 2) {
     res.status(400).json({ error: "Invalid user ID" });
     return;
@@ -751,4 +738,5 @@ app.post("/u/:userId", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Credits MCP running on :${PORT}`);
   console.log(`Routes: POST /mcp and POST /u/:userId`);
+  console.log("Auth: disabled");
 });
