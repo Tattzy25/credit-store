@@ -1,0 +1,22 @@
+{
+  "name": "credits-store",
+  "version": "1.0.0",
+  "description": "Credits MCP server with HTTP streaming, JSON-RPC 2.0, Express, and Upstash Redis REST",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "express": "^4.21.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.11.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.5.0"
+  }
+}
