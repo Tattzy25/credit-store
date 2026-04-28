@@ -12,7 +12,6 @@ import type { Request, Response } from "express";
 process.env.DEBUG = "mcp:*";
 
 const app = express();
-app.use(express.json());
 
 const server = new McpServer({
   name: "Echo",
@@ -51,9 +50,6 @@ server.prompt("echo", { message: z.string() }, ({ message }) => ({
 
 app.post("/mcp", async (req: Request, res: Response) => {
   try {
-    // Log incoming request for debugging
-    console.log("Received request:", JSON.stringify(req.body, null, 2));
-
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
     });
@@ -64,7 +60,7 @@ app.post("/mcp", async (req: Request, res: Response) => {
     });
 
     await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
+    await transport.handleRequest(req, res);
   } catch (error) {
     console.error("Error handling MCP request:", error);
     if (!res.headersSent) {
