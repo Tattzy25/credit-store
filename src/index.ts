@@ -295,9 +295,11 @@ function currentMonthKey(date: Date) {
   }
   return date.toISOString().slice(0, 7);
 }
-function getSessionHeader(req: Request): string | undefined {
+function getSessionHeader(req: Request): string {
   const sessionId = req.header("mcp-session-id");
-  if (!sessionId) return undefined;
+  if (!sessionId) {
+    throw new Error("Missing mcp-session-id header");
+  }
 
   const trimmed = sessionId.trim();
   if (!trimmed) {
