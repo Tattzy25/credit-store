@@ -6,7 +6,14 @@ import { z } from "zod";
 
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL!;
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN!;
-const PORT = parseInt(process.env.PORT || "3001", 10);
+const PORT_RAW = process.env.PORT;
+if (!PORT_RAW) {
+  throw new Error("Missing PORT");
+}
+const PORT = Number.parseInt(PORT_RAW, 10);
+if (!Number.isInteger(PORT) || PORT <= 0 || PORT > 65535) {
+  throw new Error(`Invalid PORT: ${PORT_RAW}`);
+}
 
 if (!REDIS_URL || !REDIS_TOKEN) {
   throw new Error("Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN");
@@ -254,14 +261,25 @@ function sleep(ms: number) {
 function normalizeUserId(raw: string): string {
   return raw.trim().toLowerCase();
 }
-
-function safeParseNumber(value: unknown, fallback = 0): number {
+function requireFiniteNumber(value: unknown, label: string): number {
   if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.length > 0) {
+
+  if (typeof value === "string" && value.trim() !== "") {
     const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : fallback;
+    if (Number.isFinite(parsed)) return parsed;
   }
-  return fallback;
+
+  throw new Error(`Expected finite number for ${label}, got: ${String(value)}`);
+}
+
+function requirePositiveInt(value: unknown, label: string): number {
+  const parsed = requireFiniteNumber(value, label);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(
+      `Expected non-negative integer for ${label}, got: ${String(value)}`,
+    );
+  }
+  return parsed;
 }
 
 function requireFeature(code: FeatureCode): FeatureConfig {
@@ -271,18 +289,22 @@ function requireFeature(code: FeatureCode): FeatureConfig {
   }
   return feature;
 }
-
-function currentMonthKey(date = new Date()) {
+function currentMonthKey(date: Date) {
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) {
+    throw new Error("currentMonthKey requires a valid Date");
+  }
   return date.toISOString().slice(0, 7);
 }
-
 function getSessionHeader(req: Request): string | undefined {
-  return (
-    req.header("mcp-session-id") ||
-    req.header("Mcp-Session-Id") ||
-    req.header("MCP-Session-Id") ||
-    undefined
-  );
+  const sessionId = req.header("mcp-session-id");
+  if (!sessionId) return undefined;
+
+  const trimmed = sessionId.trim();
+  if (!trimmed) {
+    throw new Error("Mcp-Session-Id header is empty");
+  }
+
+  return trimmed;
 }
 
 function setCommonHeaders(res: Response) {
@@ -324,18 +346,38 @@ async function redisCommand<T = unknown>(
     },
   });
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Redis command failed: ${parts[0]} ${res.status} ${text}`);
-  }
+  const rawText = await res.text();
 
-  const data = (await res.json()) as { result?: T };
-  return (data.result ?? null) as T | null;
+if (!res.ok) {
+  throw new Error(`Redis command failed: ${parts[0]} ${res.status} ${rawText}`);
 }
 
+let data: unknown;
+
+try {
+  data = JSON.parse(rawText);
+} catch {
+  throw new Error(`Redis returned non-JSON for ${parts[0]}: ${rawText.slice(0, 300)}`);
+}
+
+if (!data || typeof data !== "object" || !("result" in data)) {
+  throw new Error(`Redis response missing result for ${parts[0]}: ${rawText.slice(0, 300)}`);
+}
+
+return (data as { result: T | null }).result;
+
 async function getString(key: string): Promise<string | null> {
-  const result = await redisCommand<string>("GET", key);
-  return result ?? null;
+  const result = await redisCommand<unknown>("GET", key);
+
+  if (result === null) {
+    return null;
+  }
+
+  if (typeof result !== "string") {
+    throw new Error(`Expected Redis GET ${key} to return string|null, got ${typeof result}`);
+  }
+
+  return result;
 }
 
 async function setString(key: string, value: string, ttlSeconds?: number) {
@@ -348,11 +390,16 @@ async function setString(key: string, value: string, ttlSeconds?: number) {
 
 async function getJson<T>(key: string): Promise<T | null> {
   const raw = await getString(key);
-  if (!raw) return null;
+
+  if (raw === null) {
+    return null;
+  }
+
   try {
     return JSON.parse(raw) as T;
-  } catch {
-    return null;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Invalid JSON at Redis key ${key}: ${message}; raw=${raw.slice(0, 300)}`);
   }
 }
 
@@ -389,10 +436,8 @@ async function getIndexedJsonPage<T>(
   hasMore: boolean;
   total: number;
 }> {
-  const total = safeParseNumber(
-    await redisCommand<number>("LLEN", indexKey),
-    0,
-  );
+  const totalRaw = await redisCommand<unknown>("LLEN", indexKey);
+  const total = requirePositiveInt(totalRaw, `LLEN ${indexKey}`);
 
   if (total === 0) {
     return {
@@ -415,17 +460,30 @@ async function getIndexedJsonPage<T>(
     };
   }
 
-  const itemKeys =
-    (await redisCommand<string[]>("LRANGE", indexKey, offset, end)) || [];
+  const itemKeysRaw = await redisCommand<unknown>("LRANGE", indexKey, offset, end);
 
-  const items = (
-    await Promise.all(
-      itemKeys.map(async (key) => {
-        const value = await getJson<T>(key);
-        return value;
-      }),
-    )
-  ).filter(Boolean) as T[];
+if (!Array.isArray(itemKeysRaw)) {
+  throw new Error(`LRANGE ${indexKey} did not return an array`);
+}
+
+const itemKeys = itemKeysRaw.map((value, index) => {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`Invalid item key at ${indexKey}[${offset + index}]`);
+  }
+  return value;
+});
+
+const items = await Promise.all(
+  itemKeys.map(async (key) => {
+    const value = await getJson<T>(key);
+
+    if (value === null) {
+      throw new Error(`Indexed key ${key} referenced by ${indexKey} is missing`);
+    }
+
+    return value;
+  }),
+);
 
   const nextOffset = offset + items.length;
   const hasMore = nextOffset < total;
