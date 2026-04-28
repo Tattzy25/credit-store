@@ -1,25 +1,17 @@
 import { randomUUID } from "crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import express, { NextFunction, Request, Response } from "express";
+import express, { Request, Response } from "express";
 import { z } from "zod";
+
+// ---------------------------------------------------------------------------
+// CONFIG
+// ---------------------------------------------------------------------------
 
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL!;
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN!;
-const PORT_RAW = process.env.PORT;
-if (!PORT_RAW) {
-  throw new Error("Missing PORT");
-}
-const PORT = Number.parseInt(PORT_RAW, 10);
-if (!Number.isInteger(PORT) || PORT <= 0 || PORT > 65535) {
-  throw new Error(`Invalid PORT: ${PORT_RAW}`);
-}
+const PORT = Number(process.env.PORT) || 3000;
 
-if (!REDIS_URL || !REDIS_TOKEN) {
-  throw new Error("Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN");
-}
-
-type AccessMode = "read" | "write";
 type BillingUnit = "credit" | "minute";
 type FeatureCode =
   | "image_generate"
@@ -131,23 +123,12 @@ interface GrantMarker {
   createdAt: string;
 }
 
-interface SessionRecord {
-  sessionId: string;
-  userId: string;
-  access: AccessMode;
-  server: McpServer;
-  transport: StreamableHTTPServerTransport;
-  createdAt: number;
-  lastSeenAt: number;
-}
-
 const SIGNUP_FREE_CREDITS = 25;
 const MONTHLY_FREE_CREDITS = 25;
 const MAX_LEDGER_ITEMS = 5000;
 const MAX_USAGE_ITEMS = 5000;
 const MAX_LIVE_SESSION_ITEMS = 500;
 const IDEM_TTL_SECONDS = 60 * 60 * 24 * 90;
-const SESSION_TTL_MS = 1000 * 60 * 60 * 24;
 
 const FEATURE_CONFIGS: Record<FeatureCode, FeatureConfig> = {
   image_generate: {
@@ -231,8 +212,6 @@ const PACK_BY_CODE = new Map<PackCode, CreditPack>(
   CREDIT_PACKS.map((pack) => [pack.code, pack]),
 );
 
-const sessions = new Map<string, SessionRecord>();
-
 const walletKey = (userId: string) => `credits:${userId}:wallet`;
 const ledgerIndexKey = (userId: string) => `credits:${userId}:ledger:index`;
 const ledgerItemKey = (userId: string, id: string) =>
@@ -252,10 +231,6 @@ const lockKey = (userId: string) => `credits:${userId}:lock`;
 
 function nowIso() {
   return new Date().toISOString();
-}
-
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function normalizeUserId(raw: string): string {
@@ -295,34 +270,9 @@ function currentMonthKey(date: Date) {
   }
   return date.toISOString().slice(0, 7);
 }
-function getSessionHeader(req: Request): string {
-  const sessionId = req.header("mcp-session-id");
-  if (!sessionId) {
-    throw new Error("Missing mcp-session-id header");
-  }
-
-  const trimmed = sessionId.trim();
-  if (!trimmed) {
-    throw new Error("Mcp-Session-Id header is empty");
-  }
-
-  return trimmed;
-}
-
-function setCommonHeaders(res: Response) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    [
-      "Content-Type",
-      "Accept",
-      "Mcp-Session-Id",
-      "mcp-session-id",
-      "x-user-id",
-    ].join(", "),
-  );
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-}
+// ---------------------------------------------------------------------------
+// REDIS HELPERS
+// ---------------------------------------------------------------------------
 
 function jsonText(payload: unknown) {
   return {
@@ -337,7 +287,7 @@ function jsonText(payload: unknown) {
 
 async function redisCommand<T = unknown>(
   ...parts: Array<string | number>
-): Promise<T> {
+): Promise<T | null> {
   const encoded = parts
     .map((part) => encodeURIComponent(String(part)))
     .join("/");
@@ -366,20 +316,12 @@ async function redisCommand<T = unknown>(
     throw new Error(`Redis response missing result for ${parts[0]}: ${rawText.slice(0, 300)}`);
   }
 
-  const result = (data as { result: T | null }).result;
-  if (result === null || result === undefined) {
-    throw new Error(`Redis command ${parts[0]} returned null/undefined`);
-  }
-  return result;
+  return (data as { result: T | null }).result;
 }
 
-async function getString(key: string): Promise<string> {
-  const result = await redisCommand<unknown>("GET", key);
-
-  if (typeof result !== "string") {
-    throw new Error(`Expected Redis GET ${key} to return string, got ${typeof result}`);
-  }
-
+async function getString(key: string): Promise<string | null> {
+  const result = await redisCommand<string>("GET", key);
+  if (typeof result !== "string") return null;
   return result;
 }
 
@@ -391,9 +333,9 @@ async function setString(key: string, value: string, ttlSeconds?: number) {
   await redisCommand("SET", key, value);
 }
 
-async function getJson<T>(key: string): Promise<T> {
+async function getJson<T>(key: string): Promise<T | null> {
   const raw = await getString(key);
-
+  if (raw === null) return null;
   try {
     return JSON.parse(raw) as T;
   } catch (error) {
@@ -436,7 +378,7 @@ async function getIndexedJsonPage<T>(
   total: number;
 }> {
   const totalRaw = await redisCommand<unknown>("LLEN", indexKey);
-  const total = requirePositiveInt(totalRaw, `LLEN ${indexKey}`);
+  const total = requirePositiveInt(totalRaw ?? 0, `LLEN ${indexKey}`);
 
   if (total === 0) {
     return {
@@ -459,25 +401,21 @@ async function getIndexedJsonPage<T>(
     };
   }
 
-  const itemKeysRaw = await redisCommand<unknown>("LRANGE", indexKey, offset, end);
+  const itemKeysRaw = await redisCommand<unknown[]>("LRANGE", indexKey, offset, end);
 
-if (!Array.isArray(itemKeysRaw)) {
-  throw new Error(`LRANGE ${indexKey} did not return an array`);
-}
-
-const itemKeys = itemKeysRaw.map((value, index) => {
-  if (typeof value !== "string" || value.length === 0) {
-    throw new Error(`Invalid item key at ${indexKey}[${offset + index}]`);
+  if (!Array.isArray(itemKeysRaw)) {
+    throw new Error(`LRANGE ${indexKey} did not return an array`);
   }
-  return value;
-});
 
-const items = await Promise.all(
-  itemKeys.map(async (key) => {
-    const value = await getJson<T>(key);
+  const itemKeys = itemKeysRaw.map((value, index) => {
+    if (typeof value !== "string" || value.length === 0) {
+      throw new Error(`Invalid item key at ${indexKey}[${offset + index}]`);
+    }
     return value;
-  }),
-);
+  });
+
+  const rawItems = await Promise.all(itemKeys.map((key) => getJson<T>(key)));
+  const items = rawItems.filter((v): v is T => v !== null);
 
   const nextOffset = offset + items.length;
   const hasMore = nextOffset < total;
@@ -491,63 +429,601 @@ const items = await Promise.all(
 }
 
 // ---------------------------------------------------------------------------
-// Express app
+// MCP SERVER FACTORY
+// ---------------------------------------------------------------------------
+
+function createCreditStoreServer(userId: string): McpServer {
+  const server = new McpServer({
+    name: "credit-store",
+    version: "1.0.0",
+  });
+
+  // --- Wallet ---
+
+  server.tool(
+    "get_balance",
+    "Get the current credit balance for the user",
+    {},
+    async () => {
+      const wallet = await getJson<Wallet>(walletKey(userId));
+      if (!wallet) {
+        return jsonText({ userId, balance: 0, updatedAt: null });
+      }
+      return jsonText(wallet);
+    },
+  );
+
+  server.tool(
+    "get_wallet",
+    "Get full wallet details for the user",
+    {},
+    async () => {
+      const wallet = await getJson<Wallet>(walletKey(userId));
+      return jsonText(wallet ?? { userId, balance: 0, updatedAt: null });
+    },
+  );
+
+  // --- Ledger ---
+
+  server.tool(
+    "get_ledger",
+    "Get paginated credit ledger entries for the user",
+    {
+      cursor: z.string().optional().describe("Pagination cursor (offset)"),
+      limit: z.number().int().min(1).max(100).optional().describe("Items per page (default 25)"),
+    },
+    async ({ cursor, limit }) => {
+      const page = await getIndexedJsonPage<CreditLedgerEntry>(
+        ledgerIndexKey(userId),
+        cursor ? Number(cursor) : 0,
+        limit ?? 25,
+      );
+      return jsonText(page);
+    },
+  );
+
+  // --- Usage ---
+
+  server.tool(
+    "get_usage",
+    "Get paginated usage events for the user",
+    {
+      cursor: z.string().optional().describe("Pagination cursor (offset)"),
+      limit: z.number().int().min(1).max(100).optional().describe("Items per page (default 25)"),
+    },
+    async ({ cursor, limit }) => {
+      const page = await getIndexedJsonPage<UsageEvent>(
+        usageIndexKey(userId),
+        cursor ? Number(cursor) : 0,
+        limit ?? 25,
+      );
+      return jsonText(page);
+    },
+  );
+
+  server.tool(
+    "record_usage",
+    "Record a feature usage event and deduct credits from the user's wallet",
+    {
+      featureCode: z.enum(["image_generate", "image_edit", "photo_booth", "model_train", "live_minute"]).describe("Feature being used"),
+      quantity: z.number().int().min(1).describe("Number of units consumed"),
+      referenceId: z.string().min(1).describe("External reference ID (e.g. job ID)"),
+      idempotencyKey: z.string().optional().describe("Idempotency key to prevent duplicate charges"),
+      sessionId: z.string().optional().describe("Session ID if applicable"),
+      platform: z.string().optional().describe("Platform identifier"),
+      domain: z.string().optional().describe("Domain identifier"),
+    },
+    async ({ featureCode, quantity, referenceId, idempotencyKey, sessionId, platform, domain }) => {
+      const feature = requireFeature(featureCode as FeatureCode);
+      const creditsCharged = feature.creditsPerUnit * quantity;
+
+      // Idempotency check
+      if (idempotencyKey) {
+        const idemKey = idempotencyKeyFor(userId, idempotencyKey);
+        const existing = await getString(idemKey);
+        if (existing !== null) {
+          return jsonText({ duplicate: true, idempotencyKey });
+        }
+      }
+
+      // Acquire lock
+      const lock = lockKey(userId);
+      const lockAcquired = await redisCommand("SET", lock, "1", "NX", "EX", 10);
+      if (!lockAcquired) {
+        throw new Error("Could not acquire wallet lock — try again");
+      }
+
+      try {
+        const wallet = await getJson<Wallet>(walletKey(userId));
+        const currentBalance = wallet?.balance ?? 0;
+
+        if (currentBalance < creditsCharged) {
+          throw new Error(`Insufficient credits: need ${creditsCharged}, have ${currentBalance}`);
+        }
+
+        const newBalance = currentBalance - creditsCharged;
+        const now = nowIso();
+        const entryId = randomUUID();
+
+        const ledgerEntry: CreditLedgerEntry = {
+          id: entryId,
+          userId,
+          entryType: "usage",
+          amount: -creditsCharged,
+          balanceAfter: newBalance,
+          referenceType: "feature_usage",
+          referenceId,
+          idempotencyKey,
+          description: `${feature.name} x${quantity}`,
+          createdAt: now,
+        };
+
+        const usageId = randomUUID();
+        const usageEvent: UsageEvent = {
+          id: usageId,
+          userId,
+          featureCode: featureCode as FeatureCode,
+          billingUnit: feature.billingUnit,
+          quantity,
+          creditsCharged,
+          referenceId,
+          idempotencyKey,
+          sessionId,
+          platform,
+          domain,
+          status: "completed",
+          ledgerEntryId: entryId,
+          createdAt: now,
+          completedAt: now,
+        };
+
+        const updatedWallet: Wallet = { userId, balance: newBalance, updatedAt: now };
+
+        await setJson(walletKey(userId), updatedWallet);
+        await appendIndexedJson(ledgerIndexKey(userId), ledgerItemKey(userId, entryId), ledgerEntry, MAX_LEDGER_ITEMS);
+        await appendIndexedJson(usageIndexKey(userId), usageItemKey(userId, usageId), usageEvent, MAX_USAGE_ITEMS);
+
+        if (idempotencyKey) {
+          await setString(idempotencyKeyFor(userId, idempotencyKey), entryId, IDEM_TTL_SECONDS);
+        }
+
+        return jsonText({ success: true, creditsCharged, newBalance, ledgerEntryId: entryId, usageEventId: usageId });
+      } finally {
+        await deleteKey(lock);
+      }
+    },
+  );
+
+  server.tool(
+    "refund_usage",
+    "Refund credits for a previously recorded usage event",
+    {
+      usageEventId: z.string().min(1).describe("ID of the usage event to refund"),
+    },
+    async ({ usageEventId }) => {
+      const lock = lockKey(userId);
+      const lockAcquired = await redisCommand("SET", lock, "1", "NX", "EX", 10);
+      if (!lockAcquired) {
+        throw new Error("Could not acquire wallet lock — try again");
+      }
+
+      try {
+        const usageEvent = await getJson<UsageEvent>(usageItemKey(userId, usageEventId));
+        if (!usageEvent) {
+          throw new Error(`Usage event not found: ${usageEventId}`);
+        }
+        if (usageEvent.status === "refunded") {
+          return jsonText({ duplicate: true, message: "Already refunded" });
+        }
+
+        const wallet = await getJson<Wallet>(walletKey(userId));
+        const currentBalance = wallet?.balance ?? 0;
+        const newBalance = currentBalance + usageEvent.creditsCharged;
+        const now = nowIso();
+        const refundEntryId = randomUUID();
+
+        const refundEntry: CreditLedgerEntry = {
+          id: refundEntryId,
+          userId,
+          entryType: "auto_refund",
+          amount: usageEvent.creditsCharged,
+          balanceAfter: newBalance,
+          referenceType: "auto_refund",
+          referenceId: usageEventId,
+          description: `Refund for usage ${usageEventId}`,
+          createdAt: now,
+        };
+
+        const updatedUsage: UsageEvent = { ...usageEvent, status: "refunded", autoRefundLedgerEntryId: refundEntryId };
+        const updatedWallet: Wallet = { userId, balance: newBalance, updatedAt: now };
+
+        await setJson(walletKey(userId), updatedWallet);
+        await setJson(usageItemKey(userId, usageEventId), updatedUsage);
+        await appendIndexedJson(ledgerIndexKey(userId), ledgerItemKey(userId, refundEntryId), refundEntry, MAX_LEDGER_ITEMS);
+
+        return jsonText({ success: true, creditsRefunded: usageEvent.creditsCharged, newBalance, refundLedgerEntryId: refundEntryId });
+      } finally {
+        await deleteKey(lock);
+      }
+    },
+  );
+
+  // --- Credit packs ---
+
+  server.tool(
+    "list_credit_packs",
+    "List all available credit packs",
+    {},
+    async () => {
+      return jsonText(CREDIT_PACKS.filter((p) => p.active));
+    },
+  );
+
+  server.tool(
+    "purchase_credits",
+    "Record a credit pack purchase and add credits to the user's wallet",
+    {
+      packCode: z.enum(["basic", "standard", "plus", "ultimate"]).describe("Credit pack to purchase"),
+      referenceId: z.string().min(1).describe("External reference ID (e.g. Shopify order ID)"),
+      idempotencyKey: z.string().optional().describe("Idempotency key to prevent duplicate purchases"),
+    },
+    async ({ packCode, referenceId, idempotencyKey }) => {
+      const pack = PACK_BY_CODE.get(packCode as PackCode);
+      if (!pack || !pack.active) {
+        throw new Error(`Unknown or inactive pack: ${packCode}`);
+      }
+
+      if (idempotencyKey) {
+        const idemKey = idempotencyKeyFor(userId, idempotencyKey);
+        const existing = await getString(idemKey);
+        if (existing !== null) {
+          return jsonText({ duplicate: true, idempotencyKey });
+        }
+      }
+
+      const lock = lockKey(userId);
+      const lockAcquired = await redisCommand("SET", lock, "1", "NX", "EX", 10);
+      if (!lockAcquired) {
+        throw new Error("Could not acquire wallet lock — try again");
+      }
+
+      try {
+        const wallet = await getJson<Wallet>(walletKey(userId));
+        const currentBalance = wallet?.balance ?? 0;
+        const newBalance = currentBalance + pack.credits;
+        const now = nowIso();
+        const entryId = randomUUID();
+
+        const ledgerEntry: CreditLedgerEntry = {
+          id: entryId,
+          userId,
+          entryType: "purchase",
+          amount: pack.credits,
+          balanceAfter: newBalance,
+          referenceType: "pack_purchase",
+          referenceId,
+          idempotencyKey,
+          description: `Purchased ${pack.name} (${pack.credits} credits)`,
+          createdAt: now,
+        };
+
+        const updatedWallet: Wallet = { userId, balance: newBalance, updatedAt: now };
+
+        await setJson(walletKey(userId), updatedWallet);
+        await appendIndexedJson(ledgerIndexKey(userId), ledgerItemKey(userId, entryId), ledgerEntry, MAX_LEDGER_ITEMS);
+
+        if (idempotencyKey) {
+          await setString(idempotencyKeyFor(userId, idempotencyKey), entryId, IDEM_TTL_SECONDS);
+        }
+
+        return jsonText({ success: true, creditsAdded: pack.credits, newBalance, ledgerEntryId: entryId });
+      } finally {
+        await deleteKey(lock);
+      }
+    },
+  );
+
+  // --- Grants ---
+
+  server.tool(
+    "grant_signup_credits",
+    "Grant signup bonus credits to a new user (idempotent)",
+    {},
+    async () => {
+      const existing = await getString(signupGrantKey(userId));
+      if (existing !== null) {
+        return jsonText({ duplicate: true, message: "Signup grant already issued" });
+      }
+
+      const lock = lockKey(userId);
+      const lockAcquired = await redisCommand("SET", lock, "1", "NX", "EX", 10);
+      if (!lockAcquired) {
+        throw new Error("Could not acquire wallet lock — try again");
+      }
+
+      try {
+        const wallet = await getJson<Wallet>(walletKey(userId));
+        const currentBalance = wallet?.balance ?? 0;
+        const newBalance = currentBalance + SIGNUP_FREE_CREDITS;
+        const now = nowIso();
+        const entryId = randomUUID();
+
+        const ledgerEntry: CreditLedgerEntry = {
+          id: entryId,
+          userId,
+          entryType: "signup_grant",
+          amount: SIGNUP_FREE_CREDITS,
+          balanceAfter: newBalance,
+          referenceType: "signup_bonus",
+          referenceId: userId,
+          description: `Signup bonus: ${SIGNUP_FREE_CREDITS} credits`,
+          createdAt: now,
+        };
+
+        const grantMarker: GrantMarker = {
+          userId,
+          grantType: "signup_grant",
+          period: "once",
+          ledgerEntryId: entryId,
+          createdAt: now,
+        };
+
+        const updatedWallet: Wallet = { userId, balance: newBalance, updatedAt: now };
+
+        await setJson(walletKey(userId), updatedWallet);
+        await appendIndexedJson(ledgerIndexKey(userId), ledgerItemKey(userId, entryId), ledgerEntry, MAX_LEDGER_ITEMS);
+        await setJson(signupGrantKey(userId), grantMarker);
+
+        return jsonText({ success: true, creditsGranted: SIGNUP_FREE_CREDITS, newBalance, ledgerEntryId: entryId });
+      } finally {
+        await deleteKey(lock);
+      }
+    },
+  );
+
+  server.tool(
+    "grant_monthly_credits",
+    "Grant monthly bonus credits to a user (idempotent per calendar month)",
+    {
+      month: z.string().optional().describe("Month in YYYY-MM format (defaults to current month)"),
+    },
+    async ({ month }) => {
+      const monthKey = month ?? currentMonthKey(new Date());
+      const existing = await getString(monthlyGrantKey(userId, monthKey));
+      if (existing !== null) {
+        return jsonText({ duplicate: true, message: `Monthly grant already issued for ${monthKey}` });
+      }
+
+      const lock = lockKey(userId);
+      const lockAcquired = await redisCommand("SET", lock, "1", "NX", "EX", 10);
+      if (!lockAcquired) {
+        throw new Error("Could not acquire wallet lock — try again");
+      }
+
+      try {
+        const wallet = await getJson<Wallet>(walletKey(userId));
+        const currentBalance = wallet?.balance ?? 0;
+        const newBalance = currentBalance + MONTHLY_FREE_CREDITS;
+        const now = nowIso();
+        const entryId = randomUUID();
+
+        const ledgerEntry: CreditLedgerEntry = {
+          id: entryId,
+          userId,
+          entryType: "monthly_grant",
+          amount: MONTHLY_FREE_CREDITS,
+          balanceAfter: newBalance,
+          referenceType: "monthly_bonus",
+          referenceId: monthKey,
+          description: `Monthly bonus: ${MONTHLY_FREE_CREDITS} credits for ${monthKey}`,
+          createdAt: now,
+        };
+
+        const grantMarker: GrantMarker = {
+          userId,
+          grantType: "monthly_grant",
+          period: monthKey,
+          ledgerEntryId: entryId,
+          createdAt: now,
+        };
+
+        const updatedWallet: Wallet = { userId, balance: newBalance, updatedAt: now };
+
+        await setJson(walletKey(userId), updatedWallet);
+        await appendIndexedJson(ledgerIndexKey(userId), ledgerItemKey(userId, entryId), ledgerEntry, MAX_LEDGER_ITEMS);
+        await setJson(monthlyGrantKey(userId, monthKey), grantMarker);
+
+        return jsonText({ success: true, creditsGranted: MONTHLY_FREE_CREDITS, newBalance, ledgerEntryId: entryId, month: monthKey });
+      } finally {
+        await deleteKey(lock);
+      }
+    },
+  );
+
+  // --- Live sessions ---
+
+  server.tool(
+    "start_live_session",
+    "Start a live session for the user",
+    {
+      platform: z.string().optional().describe("Platform identifier"),
+      domain: z.string().optional().describe("Domain identifier"),
+    },
+    async ({ platform, domain }) => {
+      const sessionId = randomUUID();
+      const now = nowIso();
+
+      const session: LiveSession = {
+        id: sessionId,
+        userId,
+        featureCode: "live_minute",
+        startedAt: now,
+        status: "active",
+        totalMinutesCharged: 0,
+        totalCreditsCharged: 0,
+        platform,
+        domain,
+      };
+
+      await appendIndexedJson(liveSessionIndexKey(userId), liveSessionKey(userId, sessionId), session, MAX_LIVE_SESSION_ITEMS);
+
+      return jsonText({ success: true, sessionId, startedAt: now });
+    },
+  );
+
+  server.tool(
+    "charge_live_minute",
+    "Charge one minute of live session credits",
+    {
+      sessionId: z.string().min(1).describe("Live session ID"),
+    },
+    async ({ sessionId }) => {
+      const feature = requireFeature("live_minute");
+      const creditsPerMinute = feature.creditsPerUnit;
+
+      const lock = lockKey(userId);
+      const lockAcquired = await redisCommand("SET", lock, "1", "NX", "EX", 10);
+      if (!lockAcquired) {
+        throw new Error("Could not acquire wallet lock — try again");
+      }
+
+      try {
+        const session = await getJson<LiveSession>(liveSessionKey(userId, sessionId));
+        if (!session) {
+          throw new Error(`Live session not found: ${sessionId}`);
+        }
+        if (session.status !== "active") {
+          throw new Error(`Live session is not active: ${session.status}`);
+        }
+
+        const wallet = await getJson<Wallet>(walletKey(userId));
+        const currentBalance = wallet?.balance ?? 0;
+
+        if (currentBalance < creditsPerMinute) {
+          throw new Error(`Insufficient credits: need ${creditsPerMinute}, have ${currentBalance}`);
+        }
+
+        const newBalance = currentBalance - creditsPerMinute;
+        const now = nowIso();
+        const entryId = randomUUID();
+
+        const ledgerEntry: CreditLedgerEntry = {
+          id: entryId,
+          userId,
+          entryType: "usage",
+          amount: -creditsPerMinute,
+          balanceAfter: newBalance,
+          referenceType: "feature_usage",
+          referenceId: sessionId,
+          description: `Live minute charge for session ${sessionId}`,
+          createdAt: now,
+        };
+
+        const updatedSession: LiveSession = {
+          ...session,
+          totalMinutesCharged: session.totalMinutesCharged + 1,
+          totalCreditsCharged: session.totalCreditsCharged + creditsPerMinute,
+          lastMinuteChargedAt: now,
+        };
+
+        const updatedWallet: Wallet = { userId, balance: newBalance, updatedAt: now };
+
+        await setJson(walletKey(userId), updatedWallet);
+        await setJson(liveSessionKey(userId, sessionId), updatedSession);
+        await appendIndexedJson(ledgerIndexKey(userId), ledgerItemKey(userId, entryId), ledgerEntry, MAX_LEDGER_ITEMS);
+
+        return jsonText({ success: true, creditsCharged: creditsPerMinute, newBalance, totalMinutesCharged: updatedSession.totalMinutesCharged });
+      } finally {
+        await deleteKey(lock);
+      }
+    },
+  );
+
+  server.tool(
+    "end_live_session",
+    "End an active live session",
+    {
+      sessionId: z.string().min(1).describe("Live session ID"),
+    },
+    async ({ sessionId }) => {
+      const session = await getJson<LiveSession>(liveSessionKey(userId, sessionId));
+      if (!session) {
+        throw new Error(`Live session not found: ${sessionId}`);
+      }
+      if (session.status !== "active") {
+        return jsonText({ duplicate: true, message: `Session already ${session.status}` });
+      }
+
+      const now = nowIso();
+      const updatedSession: LiveSession = { ...session, status: "ended", endedAt: now };
+      await setJson(liveSessionKey(userId, sessionId), updatedSession);
+
+      return jsonText({ success: true, sessionId, endedAt: now, totalMinutesCharged: updatedSession.totalMinutesCharged, totalCreditsCharged: updatedSession.totalCreditsCharged });
+    },
+  );
+
+  server.tool(
+    "get_live_sessions",
+    "Get paginated live sessions for the user",
+    {
+      cursor: z.string().optional().describe("Pagination cursor (offset)"),
+      limit: z.number().int().min(1).max(100).optional().describe("Items per page (default 25)"),
+    },
+    async ({ cursor, limit }) => {
+      const page = await getIndexedJsonPage<LiveSession>(
+        liveSessionIndexKey(userId),
+        cursor ? Number(cursor) : 0,
+        limit ?? 25,
+      );
+      return jsonText(page);
+    },
+  );
+
+  // --- Feature configs ---
+
+  server.tool(
+    "list_features",
+    "List all feature configurations",
+    {},
+    async () => {
+      return jsonText(Object.values(FEATURE_CONFIGS));
+    },
+  );
+
+  return server;
+}
+
+// ---------------------------------------------------------------------------
+// EXPRESS
 // ---------------------------------------------------------------------------
 
 const app = express();
 
 app.use(express.json());
 
-// ---------------------------------------------------------------------------
-// Request validation middleware
-// ---------------------------------------------------------------------------
+app.get("/favicon.ico", (_req: Request, res: Response) => {
+  res.status(204).end();
+});
 
-function validateRequest(
-  req: Request,
-  res: Response,
-  next: NextFunction,
-): void {
-  const userId = req.header("x-user-id");
-  if (!userId || !userId.trim()) {
-    res.status(400).json({
-      error: "Missing or empty x-user-id header",
-      timestamp: new Date().toISOString(),
-    });
-    return;
+app.get("/health", (_req: Request, res: Response) => {
+  res.json({ status: "ok", service: "credit-store" });
+});
+
+app.post("/u/:userId", async (req: Request, res: Response) => {
+  const { userId } = req.params;
+  try {
+    const server = createCreditStoreServer(normalizeUserId(userId));
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID() });
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (error) {
+    console.error("[credit-store] error handling request", error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+    }
   }
-
-  const sessionId = req.header("mcp-session-id");
-  if (!sessionId || !sessionId.trim()) {
-    res.status(400).json({
-      error: "Missing or empty mcp-session-id header",
-      timestamp: new Date().toISOString(),
-    });
-    return;
-  }
-
-  next();
-}
-
-app.use(validateRequest);
-
-// ---------------------------------------------------------------------------
-// Error handler middleware (must be registered after all routes)
-// ---------------------------------------------------------------------------
-
-app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
-  console.error(`[ERROR] ${new Date().toISOString()} ${req.method} ${req.path}`, {
-    message: err.message,
-    stack: err.stack,
-    userId: req.header("x-user-id"),
-    sessionId: req.header("mcp-session-id"),
-  });
-
-  res.status(500).json({
-    error: err.message,
-    timestamp: new Date().toISOString(),
-  });
 });
 
 app.listen(PORT, () => {
-  console.log(`[INFO] credit-store listening on port ${PORT}`);
+  console.log(`[credit-store] listening on port ${PORT}`);
 });
