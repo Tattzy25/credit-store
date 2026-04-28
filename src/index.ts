@@ -6,7 +6,8 @@ import { z } from "zod";
 
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL!;
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN!;
-const PORT = parseInt(process.env.PORT || "3001", 10);
+const PORT = parseInt(process.env.PORT, 10);
+if (isNaN(PORT)) throw new Error("PORT must be a valid number");
 
 if (!REDIS_URL || !REDIS_TOKEN) {
   throw new Error("Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN");
@@ -255,13 +256,13 @@ function normalizeUserId(raw: string): string {
   return raw.trim().toLowerCase();
 }
 
-function safeParseNumber(value: unknown, fallback = 0): number {
+function safeParseNumber(value: unknown): number {
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value === "string" && value.length > 0) {
     const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : fallback;
+    if (Number.isFinite(parsed)) return parsed;
   }
-  return fallback;
+  throw new Error(`Cannot parse number from value: ${JSON.stringify(value)}`);
 }
 
 function requireFeature(code: FeatureCode): FeatureConfig {
@@ -272,17 +273,17 @@ function requireFeature(code: FeatureCode): FeatureConfig {
   return feature;
 }
 
-function currentMonthKey(date = new Date()) {
+function currentMonthKey(date: Date) {
   return date.toISOString().slice(0, 7);
 }
 
-function getSessionHeader(req: Request): string | undefined {
-  return (
+function getSessionHeader(req: Request): string {
+  const id =
     req.header("mcp-session-id") ||
     req.header("Mcp-Session-Id") ||
-    req.header("MCP-Session-Id") ||
-    undefined
-  );
+    req.header("MCP-Session-Id");
+  if (!id) throw new Error("Missing mcp-session-id header");
+  return id;
 }
 
 function setCommonHeaders(res: Response) {
@@ -313,7 +314,7 @@ function jsonText(payload: unknown) {
 
 async function redisCommand<T = unknown>(
   ...parts: Array<string | number>
-): Promise<T | null> {
+): Promise<T> {
   const encoded = parts
     .map((part) => encodeURIComponent(String(part)))
     .join("/");
@@ -325,12 +326,13 @@ async function redisCommand<T = unknown>(
   });
 
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
+    const text = await res.text();
     throw new Error(`Redis command failed: ${parts[0]} ${res.status} ${text}`);
   }
 
   const data = (await res.json()) as { result?: T };
-  return (data.result ?? null) as T | null;
+  if (data.result === undefined) throw new Error("Redis command returned no result");
+  return data.result as T;
 }
 
 async function getString(key: string): Promise<string | null> {
@@ -351,8 +353,8 @@ async function getJson<T>(key: string): Promise<T | null> {
   if (!raw) return null;
   try {
     return JSON.parse(raw) as T;
-  } catch {
-    return null;
+  } catch (e) {
+    throw new Error(`JSON parse failed: ${e}`);
   }
 }
 
@@ -391,7 +393,6 @@ async function getIndexedJsonPage<T>(
 }> {
   const total = safeParseNumber(
     await redisCommand<number>("LLEN", indexKey),
-    0,
   );
 
   if (total === 0) {
@@ -415,8 +416,8 @@ async function getIndexedJsonPage<T>(
     };
   }
 
-  const itemKeys =
-    (await redisCommand<string[]>("LRANGE", indexKey, offset, end)) || [];
+  const itemKeys = await redisCommand<string[]>("LRANGE", indexKey, offset, end);
+  if (!itemKeys) throw new Error("LRANGE failed");
 
   const items = (
     await Promise.all(
@@ -425,7 +426,7 @@ async function getIndexedJsonPage<T>(
         return value;
       }),
     )
-  ).filter(Boolean) as T[];
+  ).filter((item): item is T => item !== null && item !== undefined);
 
   const nextOffset = offset + items.length;
   const hasMore = nextOffset < total;
