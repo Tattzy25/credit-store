@@ -415,7 +415,7 @@ async function getIndexedJsonPage<T>(
   });
 
   const rawItems = await Promise.all(itemKeys.map((key) => getJson<T>(key)));
-  const items = rawItems.filter((v): v is T => v !== null);
+  const items = rawItems.filter((v) => v !== null) as T[];
 
   const nextOffset = offset + items.length;
   const hasMore = nextOffset < total;
