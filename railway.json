@@ -12,7 +12,7 @@
     "ipv6EgressEnabled": false,
     "multiRegionConfig": {
       "us-west2": {
-        "numReplicas": 1
+        "numReplicas": 2
       }
     },
     "restartPolicyType": "ON_FAILURE",
