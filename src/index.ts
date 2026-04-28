@@ -42,15 +42,6 @@ type LedgerReferenceType =
 type UsageStatus = "pending" | "completed" | "failed" | "refunded";
 type LiveSessionStatus = "active" | "ended" | "failed";
 
-interface FeatureConfig {
-  code: FeatureCode;
-  name: string;
-  billingUnit: BillingUnit;
-  creditsPerUnit: number;
-  active: boolean;
-  description?: string;
-}
-
 interface CreditPack {
   code: PackCode;
   name: string;
@@ -130,47 +121,12 @@ const MAX_USAGE_ITEMS = 5000;
 const MAX_LIVE_SESSION_ITEMS = 500;
 const IDEM_TTL_SECONDS = 60 * 60 * 24 * 90;
 
-const FEATURE_CONFIGS: Record<FeatureCode, FeatureConfig> = {
-  image_generate: {
-    code: "image_generate",
-    name: "Image Generate",
-    billingUnit: "credit",
-    creditsPerUnit: 1,
-    active: true,
-    description: "Single image generation",
-  },
-  image_edit: {
-    code: "image_edit",
-    name: "Image Edit",
-    billingUnit: "credit",
-    creditsPerUnit: 1,
-    active: true,
-    description: "Single image edit",
-  },
-  photo_booth: {
-    code: "photo_booth",
-    name: "Photo Booth",
-    billingUnit: "credit",
-    creditsPerUnit: 4,
-    active: true,
-    description: "Photo booth session / batch",
-  },
-  model_train: {
-    code: "model_train",
-    name: "Model Train",
-    billingUnit: "credit",
-    creditsPerUnit: 100,
-    active: true,
-    description: "Model training",
-  },
-  live_minute: {
-    code: "live_minute",
-    name: "Live Minute",
-    billingUnit: "minute",
-    creditsPerUnit: 20,
-    active: true,
-    description: "FaceTime / live session per minute",
-  },
+const FEATURE_CREDITS: Record<FeatureCode, { name: string; billingUnit: BillingUnit; creditsPerUnit: number }> = {
+  image_generate: { name: "Image Generate", billingUnit: "credit", creditsPerUnit: 1 },
+  image_edit:     { name: "Image Edit",     billingUnit: "credit", creditsPerUnit: 1 },
+  photo_booth:    { name: "Photo Booth",    billingUnit: "credit", creditsPerUnit: 4 },
+  model_train:    { name: "Model Train",    billingUnit: "credit", creditsPerUnit: 100 },
+  live_minute:    { name: "Live Minute",    billingUnit: "minute", creditsPerUnit: 20 },
 };
 
 const CREDIT_PACKS: CreditPack[] = [
@@ -257,13 +213,6 @@ function requirePositiveInt(value: unknown, label: string): number {
   return parsed;
 }
 
-function requireFeature(code: FeatureCode): FeatureConfig {
-  const feature = FEATURE_CONFIGS[code];
-  if (!feature || !feature.active) {
-    throw new Error(`Unknown or inactive feature: ${code}`);
-  }
-  return feature;
-}
 function currentMonthKey(date: Date) {
   if (!(date instanceof Date) || Number.isNaN(date.getTime())) {
     throw new Error("currentMonthKey requires a valid Date");
@@ -514,7 +463,10 @@ function createCreditStoreServer(userId: string): McpServer {
       domain: z.string().optional().describe("Domain identifier"),
     },
     async ({ featureCode, quantity, referenceId, idempotencyKey, sessionId, platform, domain }) => {
-      const feature = requireFeature(featureCode as FeatureCode);
+      const feature = FEATURE_CREDITS[featureCode as FeatureCode];
+      if (!feature) {
+        throw new Error(`Unknown feature: ${featureCode}`);
+      }
       const creditsCharged = feature.creditsPerUnit * quantity;
 
       // Idempotency check
@@ -878,8 +830,7 @@ function createCreditStoreServer(userId: string): McpServer {
       sessionId: z.string().min(1).describe("Live session ID"),
     },
     async ({ sessionId }) => {
-      const feature = requireFeature("live_minute");
-      const creditsPerMinute = feature.creditsPerUnit;
+      const creditsPerMinute = FEATURE_CREDITS["live_minute"].creditsPerUnit;
 
       const lock = lockKey(userId);
       const lockAcquired = await redisCommand("SET", lock, "1", "NX", "EX", 10);
@@ -976,17 +927,6 @@ function createCreditStoreServer(userId: string): McpServer {
         limit ?? 25,
       );
       return jsonText(page);
-    },
-  );
-
-  // --- Feature configs ---
-
-  server.tool(
-    "list_features",
-    "List all feature configurations",
-    {},
-    async () => {
-      return jsonText(Object.values(FEATURE_CONFIGS));
     },
   );
 
