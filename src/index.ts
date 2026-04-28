@@ -1,7 +1,7 @@
 import { randomUUID } from "crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import express, { Request, Response } from "express";
+import express, { NextFunction, Request, Response } from "express";
 import { z } from "zod";
 
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL!;
@@ -337,7 +337,7 @@ function jsonText(payload: unknown) {
 
 async function redisCommand<T = unknown>(
   ...parts: Array<string | number>
-): Promise<T | null> {
+): Promise<T> {
   const encoded = parts
     .map((part) => encodeURIComponent(String(part)))
     .join("/");
@@ -350,34 +350,34 @@ async function redisCommand<T = unknown>(
 
   const rawText = await res.text();
 
-if (!res.ok) {
-  throw new Error(`Redis command failed: ${parts[0]} ${res.status} ${rawText}`);
-}
-
-let data: unknown;
-
-try {
-  data = JSON.parse(rawText);
-} catch {
-  throw new Error(`Redis returned non-JSON for ${parts[0]}: ${rawText.slice(0, 300)}`);
-}
-
-if (!data || typeof data !== "object" || !("result" in data)) {
-  throw new Error(`Redis response missing result for ${parts[0]}: ${rawText.slice(0, 300)}`);
-}
-
-return (data as { result: T | null }).result;
-}
-
-async function getString(key: string): Promise<string | null> {
-  const result = await redisCommand<unknown>("GET", key);
-
-  if (result === null) {
-    return null;
+  if (!res.ok) {
+    throw new Error(`Redis command failed: ${parts[0]} ${res.status} ${rawText}`);
   }
 
+  let data: unknown;
+
+  try {
+    data = JSON.parse(rawText);
+  } catch {
+    throw new Error(`Redis returned non-JSON for ${parts[0]}: ${rawText.slice(0, 300)}`);
+  }
+
+  if (!data || typeof data !== "object" || !("result" in data)) {
+    throw new Error(`Redis response missing result for ${parts[0]}: ${rawText.slice(0, 300)}`);
+  }
+
+  const result = (data as { result: T | null }).result;
+  if (result === null || result === undefined) {
+    throw new Error(`Redis command ${parts[0]} returned null/undefined`);
+  }
+  return result;
+}
+
+async function getString(key: string): Promise<string> {
+  const result = await redisCommand<unknown>("GET", key);
+
   if (typeof result !== "string") {
-    throw new Error(`Expected Redis GET ${key} to return string|null, got ${typeof result}`);
+    throw new Error(`Expected Redis GET ${key} to return string, got ${typeof result}`);
   }
 
   return result;
@@ -391,12 +391,8 @@ async function setString(key: string, value: string, ttlSeconds?: number) {
   await redisCommand("SET", key, value);
 }
 
-async function getJson<T>(key: string): Promise<T | null> {
+async function getJson<T>(key: string): Promise<T> {
   const raw = await getString(key);
-
-  if (raw === null) {
-    return null;
-  }
 
   try {
     return JSON.parse(raw) as T;
@@ -479,11 +475,6 @@ const itemKeys = itemKeysRaw.map((value, index) => {
 const items = await Promise.all(
   itemKeys.map(async (key) => {
     const value = await getJson<T>(key);
-
-    if (value === null) {
-      throw new Error(`Indexed key ${key} referenced by ${indexKey} is missing`);
-    }
-
     return value;
   }),
 );
@@ -498,3 +489,65 @@ const items = await Promise.all(
     total,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Express app
+// ---------------------------------------------------------------------------
+
+const app = express();
+
+app.use(express.json());
+
+// ---------------------------------------------------------------------------
+// Request validation middleware
+// ---------------------------------------------------------------------------
+
+function validateRequest(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  const userId = req.header("x-user-id");
+  if (!userId || !userId.trim()) {
+    res.status(400).json({
+      error: "Missing or empty x-user-id header",
+      timestamp: new Date().toISOString(),
+    });
+    return;
+  }
+
+  const sessionId = req.header("mcp-session-id");
+  if (!sessionId || !sessionId.trim()) {
+    res.status(400).json({
+      error: "Missing or empty mcp-session-id header",
+      timestamp: new Date().toISOString(),
+    });
+    return;
+  }
+
+  next();
+}
+
+app.use(validateRequest);
+
+// ---------------------------------------------------------------------------
+// Error handler middleware (must be registered after all routes)
+// ---------------------------------------------------------------------------
+
+app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
+  console.error(`[ERROR] ${new Date().toISOString()} ${req.method} ${req.path}`, {
+    message: err.message,
+    stack: err.stack,
+    userId: req.header("x-user-id"),
+    sessionId: req.header("mcp-session-id"),
+  });
+
+  res.status(500).json({
+    error: err.message,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`[INFO] credit-store listening on port ${PORT}`);
+});
