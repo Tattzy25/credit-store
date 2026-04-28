@@ -20,8 +20,6 @@ type FeatureCode =
   | "model_train"
   | "live_minute";
 
-type PackCode = "basic" | "standard" | "plus" | "ultimate";
-
 type LedgerEntryType =
   | "purchase"
   | "signup_grant"
@@ -40,7 +38,6 @@ type LedgerReferenceType =
   | "system";
 
 type UsageStatus = "pending" | "completed" | "failed" | "refunded";
-type LiveSessionStatus = "active" | "ended" | "failed";
 
 interface FeatureConfig {
   code: FeatureCode;
@@ -49,17 +46,6 @@ interface FeatureConfig {
   creditsPerUnit: number;
   active: boolean;
   description?: string;
-}
-
-interface CreditPack {
-  code: PackCode;
-  name: string;
-  priceCents: number;
-  credits: number;
-  description?: string;
-  shopifyProductId?: string;
-  shopifyVariantId?: string;
-  active: boolean;
 }
 
 interface Wallet {
@@ -101,33 +87,8 @@ interface UsageEvent {
   completedAt?: string;
 }
 
-interface LiveSession {
-  id: string;
-  userId: string;
-  featureCode: "live_minute";
-  startedAt: string;
-  endedAt?: string;
-  status: LiveSessionStatus;
-  totalMinutesCharged: number;
-  totalCreditsCharged: number;
-  lastMinuteChargedAt?: string;
-  platform?: string;
-  domain?: string;
-}
-
-interface GrantMarker {
-  userId: string;
-  grantType: "signup_grant" | "monthly_grant";
-  period: string;
-  ledgerEntryId: string;
-  createdAt: string;
-}
-
-const SIGNUP_FREE_CREDITS = 25;
-const MONTHLY_FREE_CREDITS = 25;
 const MAX_LEDGER_ITEMS = 5000;
 const MAX_USAGE_ITEMS = 5000;
-const MAX_LIVE_SESSION_ITEMS = 500;
 const IDEM_TTL_SECONDS = 60 * 60 * 24 * 90;
 
 const FEATURE_CONFIGS: Record<FeatureCode, FeatureConfig> = {
@@ -173,45 +134,6 @@ const FEATURE_CONFIGS: Record<FeatureCode, FeatureConfig> = {
   },
 };
 
-const CREDIT_PACKS: CreditPack[] = [
-  {
-    code: "basic",
-    name: "Basic Pack",
-    priceCents: 599,
-    credits: 20,
-    description: 'The "Quick Hit" for curious users.',
-    active: true,
-  },
-  {
-    code: "standard",
-    name: "Standard Pack",
-    priceCents: 999,
-    credits: 40,
-    description: 'The "Mid-Tier" casualty.',
-    active: true,
-  },
-  {
-    code: "plus",
-    name: "Plus Pack",
-    priceCents: 1999,
-    credits: 115,
-    description: "Forced choice between Training or FaceTime.",
-    active: true,
-  },
-  {
-    code: "ultimate",
-    name: "Ultimate Pack",
-    priceCents: 9999,
-    credits: 750,
-    description: "The whale pack.",
-    active: true,
-  },
-];
-
-const PACK_BY_CODE = new Map<PackCode, CreditPack>(
-  CREDIT_PACKS.map((pack) => [pack.code, pack]),
-);
-
 const walletKey = (userId: string) => `credits:${userId}:wallet`;
 const ledgerIndexKey = (userId: string) => `credits:${userId}:ledger:index`;
 const ledgerItemKey = (userId: string, id: string) =>
@@ -219,12 +141,6 @@ const ledgerItemKey = (userId: string, id: string) =>
 const usageIndexKey = (userId: string) => `credits:${userId}:usage:index`;
 const usageItemKey = (userId: string, id: string) =>
   `credits:${userId}:usage:item:${id}`;
-const liveSessionIndexKey = (userId: string) => `credits:${userId}:live:index`;
-const liveSessionKey = (userId: string, id: string) =>
-  `credits:${userId}:live:item:${id}`;
-const signupGrantKey = (userId: string) => `credits:${userId}:grant:signup`;
-const monthlyGrantKey = (userId: string, month: string) =>
-  `credits:${userId}:grant:monthly:${month}`;
 const idempotencyKeyFor = (userId: string, key: string) =>
   `credits:${userId}:idem:${key}`;
 const lockKey = (userId: string) => `credits:${userId}:lock`;
@@ -264,12 +180,7 @@ function requireFeature(code: FeatureCode): FeatureConfig {
   }
   return feature;
 }
-function currentMonthKey(date: Date) {
-  if (!(date instanceof Date) || Number.isNaN(date.getTime())) {
-    throw new Error("currentMonthKey requires a valid Date");
-  }
-  return date.toISOString().slice(0, 7);
-}
+
 // ---------------------------------------------------------------------------
 // REDIS HELPERS
 // ---------------------------------------------------------------------------
@@ -645,337 +556,6 @@ function createCreditStoreServer(userId: string): McpServer {
       } finally {
         await deleteKey(lock);
       }
-    },
-  );
-
-  // --- Credit packs ---
-
-  server.tool(
-    "list_credit_packs",
-    "List all available credit packs",
-    {},
-    async () => {
-      return jsonText(CREDIT_PACKS.filter((p) => p.active));
-    },
-  );
-
-  server.tool(
-    "purchase_credits",
-    "Record a credit pack purchase and add credits to the user's wallet",
-    {
-      packCode: z.enum(["basic", "standard", "plus", "ultimate"]).describe("Credit pack to purchase"),
-      referenceId: z.string().min(1).describe("External reference ID (e.g. Shopify order ID)"),
-      idempotencyKey: z.string().optional().describe("Idempotency key to prevent duplicate purchases"),
-    },
-    async ({ packCode, referenceId, idempotencyKey }) => {
-      const pack = PACK_BY_CODE.get(packCode as PackCode);
-      if (!pack || !pack.active) {
-        throw new Error(`Unknown or inactive pack: ${packCode}`);
-      }
-
-      if (idempotencyKey) {
-        const idemKey = idempotencyKeyFor(userId, idempotencyKey);
-        const existing = await getString(idemKey);
-        if (existing !== null) {
-          return jsonText({ duplicate: true, idempotencyKey });
-        }
-      }
-
-      const lock = lockKey(userId);
-      const lockAcquired = await redisCommand("SET", lock, "1", "NX", "EX", 10);
-      if (!lockAcquired) {
-        throw new Error("Could not acquire wallet lock — try again");
-      }
-
-      try {
-        const wallet = await getJson<Wallet>(walletKey(userId));
-        const currentBalance = wallet?.balance ?? 0;
-        const newBalance = currentBalance + pack.credits;
-        const now = nowIso();
-        const entryId = randomUUID();
-
-        const ledgerEntry: CreditLedgerEntry = {
-          id: entryId,
-          userId,
-          entryType: "purchase",
-          amount: pack.credits,
-          balanceAfter: newBalance,
-          referenceType: "pack_purchase",
-          referenceId,
-          idempotencyKey,
-          description: `Purchased ${pack.name} (${pack.credits} credits)`,
-          createdAt: now,
-        };
-
-        const updatedWallet: Wallet = { userId, balance: newBalance, updatedAt: now };
-
-        await setJson(walletKey(userId), updatedWallet);
-        await appendIndexedJson(ledgerIndexKey(userId), ledgerItemKey(userId, entryId), ledgerEntry, MAX_LEDGER_ITEMS);
-
-        if (idempotencyKey) {
-          await setString(idempotencyKeyFor(userId, idempotencyKey), entryId, IDEM_TTL_SECONDS);
-        }
-
-        return jsonText({ success: true, creditsAdded: pack.credits, newBalance, ledgerEntryId: entryId });
-      } finally {
-        await deleteKey(lock);
-      }
-    },
-  );
-
-  // --- Grants ---
-
-  server.tool(
-    "grant_signup_credits",
-    "Grant signup bonus credits to a new user (idempotent)",
-    {},
-    async () => {
-      const existing = await getString(signupGrantKey(userId));
-      if (existing !== null) {
-        return jsonText({ duplicate: true, message: "Signup grant already issued" });
-      }
-
-      const lock = lockKey(userId);
-      const lockAcquired = await redisCommand("SET", lock, "1", "NX", "EX", 10);
-      if (!lockAcquired) {
-        throw new Error("Could not acquire wallet lock — try again");
-      }
-
-      try {
-        const wallet = await getJson<Wallet>(walletKey(userId));
-        const currentBalance = wallet?.balance ?? 0;
-        const newBalance = currentBalance + SIGNUP_FREE_CREDITS;
-        const now = nowIso();
-        const entryId = randomUUID();
-
-        const ledgerEntry: CreditLedgerEntry = {
-          id: entryId,
-          userId,
-          entryType: "signup_grant",
-          amount: SIGNUP_FREE_CREDITS,
-          balanceAfter: newBalance,
-          referenceType: "signup_bonus",
-          referenceId: userId,
-          description: `Signup bonus: ${SIGNUP_FREE_CREDITS} credits`,
-          createdAt: now,
-        };
-
-        const grantMarker: GrantMarker = {
-          userId,
-          grantType: "signup_grant",
-          period: "once",
-          ledgerEntryId: entryId,
-          createdAt: now,
-        };
-
-        const updatedWallet: Wallet = { userId, balance: newBalance, updatedAt: now };
-
-        await setJson(walletKey(userId), updatedWallet);
-        await appendIndexedJson(ledgerIndexKey(userId), ledgerItemKey(userId, entryId), ledgerEntry, MAX_LEDGER_ITEMS);
-        await setJson(signupGrantKey(userId), grantMarker);
-
-        return jsonText({ success: true, creditsGranted: SIGNUP_FREE_CREDITS, newBalance, ledgerEntryId: entryId });
-      } finally {
-        await deleteKey(lock);
-      }
-    },
-  );
-
-  server.tool(
-    "grant_monthly_credits",
-    "Grant monthly bonus credits to a user (idempotent per calendar month)",
-    {
-      month: z.string().optional().describe("Month in YYYY-MM format (defaults to current month)"),
-    },
-    async ({ month }) => {
-      const monthKey = month ?? currentMonthKey(new Date());
-      const existing = await getString(monthlyGrantKey(userId, monthKey));
-      if (existing !== null) {
-        return jsonText({ duplicate: true, message: `Monthly grant already issued for ${monthKey}` });
-      }
-
-      const lock = lockKey(userId);
-      const lockAcquired = await redisCommand("SET", lock, "1", "NX", "EX", 10);
-      if (!lockAcquired) {
-        throw new Error("Could not acquire wallet lock — try again");
-      }
-
-      try {
-        const wallet = await getJson<Wallet>(walletKey(userId));
-        const currentBalance = wallet?.balance ?? 0;
-        const newBalance = currentBalance + MONTHLY_FREE_CREDITS;
-        const now = nowIso();
-        const entryId = randomUUID();
-
-        const ledgerEntry: CreditLedgerEntry = {
-          id: entryId,
-          userId,
-          entryType: "monthly_grant",
-          amount: MONTHLY_FREE_CREDITS,
-          balanceAfter: newBalance,
-          referenceType: "monthly_bonus",
-          referenceId: monthKey,
-          description: `Monthly bonus: ${MONTHLY_FREE_CREDITS} credits for ${monthKey}`,
-          createdAt: now,
-        };
-
-        const grantMarker: GrantMarker = {
-          userId,
-          grantType: "monthly_grant",
-          period: monthKey,
-          ledgerEntryId: entryId,
-          createdAt: now,
-        };
-
-        const updatedWallet: Wallet = { userId, balance: newBalance, updatedAt: now };
-
-        await setJson(walletKey(userId), updatedWallet);
-        await appendIndexedJson(ledgerIndexKey(userId), ledgerItemKey(userId, entryId), ledgerEntry, MAX_LEDGER_ITEMS);
-        await setJson(monthlyGrantKey(userId, monthKey), grantMarker);
-
-        return jsonText({ success: true, creditsGranted: MONTHLY_FREE_CREDITS, newBalance, ledgerEntryId: entryId, month: monthKey });
-      } finally {
-        await deleteKey(lock);
-      }
-    },
-  );
-
-  // --- Live sessions ---
-
-  server.tool(
-    "start_live_session",
-    "Start a live session for the user",
-    {
-      platform: z.string().optional().describe("Platform identifier"),
-      domain: z.string().optional().describe("Domain identifier"),
-    },
-    async ({ platform, domain }) => {
-      const sessionId = randomUUID();
-      const now = nowIso();
-
-      const session: LiveSession = {
-        id: sessionId,
-        userId,
-        featureCode: "live_minute",
-        startedAt: now,
-        status: "active",
-        totalMinutesCharged: 0,
-        totalCreditsCharged: 0,
-        platform,
-        domain,
-      };
-
-      await appendIndexedJson(liveSessionIndexKey(userId), liveSessionKey(userId, sessionId), session, MAX_LIVE_SESSION_ITEMS);
-
-      return jsonText({ success: true, sessionId, startedAt: now });
-    },
-  );
-
-  server.tool(
-    "charge_live_minute",
-    "Charge one minute of live session credits",
-    {
-      sessionId: z.string().min(1).describe("Live session ID"),
-    },
-    async ({ sessionId }) => {
-      const feature = requireFeature("live_minute");
-      const creditsPerMinute = feature.creditsPerUnit;
-
-      const lock = lockKey(userId);
-      const lockAcquired = await redisCommand("SET", lock, "1", "NX", "EX", 10);
-      if (!lockAcquired) {
-        throw new Error("Could not acquire wallet lock — try again");
-      }
-
-      try {
-        const session = await getJson<LiveSession>(liveSessionKey(userId, sessionId));
-        if (!session) {
-          throw new Error(`Live session not found: ${sessionId}`);
-        }
-        if (session.status !== "active") {
-          throw new Error(`Live session is not active: ${session.status}`);
-        }
-
-        const wallet = await getJson<Wallet>(walletKey(userId));
-        const currentBalance = wallet?.balance ?? 0;
-
-        if (currentBalance < creditsPerMinute) {
-          throw new Error(`Insufficient credits: need ${creditsPerMinute}, have ${currentBalance}`);
-        }
-
-        const newBalance = currentBalance - creditsPerMinute;
-        const now = nowIso();
-        const entryId = randomUUID();
-
-        const ledgerEntry: CreditLedgerEntry = {
-          id: entryId,
-          userId,
-          entryType: "usage",
-          amount: -creditsPerMinute,
-          balanceAfter: newBalance,
-          referenceType: "feature_usage",
-          referenceId: sessionId,
-          description: `Live minute charge for session ${sessionId}`,
-          createdAt: now,
-        };
-
-        const updatedSession: LiveSession = {
-          ...session,
-          totalMinutesCharged: session.totalMinutesCharged + 1,
-          totalCreditsCharged: session.totalCreditsCharged + creditsPerMinute,
-          lastMinuteChargedAt: now,
-        };
-
-        const updatedWallet: Wallet = { userId, balance: newBalance, updatedAt: now };
-
-        await setJson(walletKey(userId), updatedWallet);
-        await setJson(liveSessionKey(userId, sessionId), updatedSession);
-        await appendIndexedJson(ledgerIndexKey(userId), ledgerItemKey(userId, entryId), ledgerEntry, MAX_LEDGER_ITEMS);
-
-        return jsonText({ success: true, creditsCharged: creditsPerMinute, newBalance, totalMinutesCharged: updatedSession.totalMinutesCharged });
-      } finally {
-        await deleteKey(lock);
-      }
-    },
-  );
-
-  server.tool(
-    "end_live_session",
-    "End an active live session",
-    {
-      sessionId: z.string().min(1).describe("Live session ID"),
-    },
-    async ({ sessionId }) => {
-      const session = await getJson<LiveSession>(liveSessionKey(userId, sessionId));
-      if (!session) {
-        throw new Error(`Live session not found: ${sessionId}`);
-      }
-      if (session.status !== "active") {
-        return jsonText({ duplicate: true, message: `Session already ${session.status}` });
-      }
-
-      const now = nowIso();
-      const updatedSession: LiveSession = { ...session, status: "ended", endedAt: now };
-      await setJson(liveSessionKey(userId, sessionId), updatedSession);
-
-      return jsonText({ success: true, sessionId, endedAt: now, totalMinutesCharged: updatedSession.totalMinutesCharged, totalCreditsCharged: updatedSession.totalCreditsCharged });
-    },
-  );
-
-  server.tool(
-    "get_live_sessions",
-    "Get paginated live sessions for the user",
-    {
-      cursor: z.string().optional().describe("Pagination cursor (offset)"),
-      limit: z.number().int().min(1).max(100).optional().describe("Items per page (default 25)"),
-    },
-    async ({ cursor, limit }) => {
-      const page = await getIndexedJsonPage<LiveSession>(
-        liveSessionIndexKey(userId),
-        cursor ? Number(cursor) : 0,
-        limit ?? 25,
-      );
-      return jsonText(page);
     },
   );
 
