@@ -1,22 +1,31 @@
 {
-  "name": "credits-store",
+  "name": "credit-store",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
   "version": "1.0.0",
-  "description": "Credits MCP server with HTTP streaming, JSON-RPC 2.0, Express, and Upstash Redis REST",
-  "main": "dist/index.js",
+  "description": "credit pack mcp",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts"
   },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.0",
-    "express": "^5.2.1",
-    "zod": "^3.23.0"
+  "engines": {
+    "node": ">=18.0.0"
   },
   "devDependencies": {
-    "@types/express": "^4.17.21",
-    "@types/node": "^20.11.0",
-    "tsx": "^4.7.0",
-    "typescript": "^6.0.3"
+    "@types/express": "^5.0.0",
+    "@types/node": "^20.4.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.2.2"
+  },
+  "files": [
+    "src"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "express": "^5.2.1",
+    "node-fetch": "^3.3.2",
+    "zod": "^4.3.6"
   }
 }
