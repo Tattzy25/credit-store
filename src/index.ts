@@ -365,6 +365,7 @@ if (!data || typeof data !== "object" || !("result" in data)) {
 }
 
 return (data as { result: T | null }).result;
+}
 
 async function getString(key: string): Promise<string | null> {
   const result = await redisCommand<unknown>("GET", key);
